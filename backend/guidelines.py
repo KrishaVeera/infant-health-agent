@@ -10,23 +10,37 @@ UA = "infant-health-agent/0.1 (+https://example.com)"  # any UA string
 
 @dataclass
 class GuidelineItem:
-    source_type: str  # "guideline"
+    source_type: str
     title: str
     snippet: Optional[str]
     year: Optional[int]
     url: str
-    org: Optional[str]  # "WHO" | "CDC" | etc.
+    org: Optional[str]
 
 def _extract_year(text: str) -> Optional[int]:
+    """Extract the most plausible year from text, or return None if none found."""
+    if not text:
+        return None
     years = re.findall(r"(20\d{2}|19\d{2})", text or "")
-    if years:
-        y = max(int(y) for y in years if 1900 <= int(y) <= datetime.utcnow().year)
-        return y
-    return None
+    if not years:
+        return None
+    # Keep only years in a realistic range
+    valid = []
+    current_year = datetime.utcnow().year
+    for y in years:
+        try:
+            yi = int(y)
+            if 1900 <= yi <= current_year:
+                valid.append(yi)
+        except Exception:
+            continue
+    if not valid:
+        return None
+    return max(valid)
 
 def _ddg_site_search(site: str, query: str, k: int = 4) -> List[GuidelineItem]:
     """
-    Very light HTML search via DuckDuckGo (no API key).
+    Light HTML search via DuckDuckGo (no API key).
     Filters results by domain. Returns top-k items.
     """
     q = f"site:{site} {query}"
@@ -46,7 +60,8 @@ def _ddg_site_search(site: str, query: str, k: int = 4) -> List[GuidelineItem]:
         # snippet lives in a sibling div
         snippet_el = res.find_parent(class_="result").select_one(".result__snippet")
         snippet = snippet_el.get_text(" ", strip=True) if snippet_el else None
-        year = _extract_year(f"{title} {snippet} {href}")
+        # Use safe concat (snippet may be None)
+        year = _extract_year(f"{title} {(snippet or '')} {href}")
         org = "WHO" if "who.int" in href else ("CDC" if "cdc.gov" in href else None)
 
         items.append(
