@@ -16,7 +16,8 @@ Rules:
 - Use only the provided items (papers/guidelines/web).
 - Cite using bracket numbers [1], [2] that match the Sources list.
 - If evidence conflicts, say so explicitly.
-- Prefer recent/high-quality sources (RCTs, meta-analyses; official orgs)."""
+- Prefer recent/high-quality sources (RCTs, meta-analyses; official orgs).
+"""
 
 def _source_line(i: int, it: Dict[str, Any]) -> str:
     year = it.get("year") or ""
@@ -24,10 +25,12 @@ def _source_line(i: int, it: Dict[str, Any]) -> str:
     org = it.get("org") or ""
     url = it.get("url") or it.get("doi") or ""
     rel = it.get("reliability_label")
+    reasons = it.get("reliability_reasons") or []
     rel_tag = f" [{rel}]" if rel else ""
+    reasons_tag = f" — reasons: {', '.join(reasons)}" if reasons else ""
     if org:
-        return f"[{i}] {org} {year}. {title}. {url}{rel_tag}"
-    return f"[{i}] {year}. {title}. {url}{rel_tag}"
+        return f"[{i}] {org} {year}. {title}. {url}{rel_tag}{reasons_tag}"
+    return f"[{i}] {year}. {title}. {url}{rel_tag}{reasons_tag}"
 
 def _format_sources(items: List[Dict[str, Any]]) -> str:
     return "\n".join(_source_line(i, it) for i, it in enumerate(items, start=1))
@@ -62,6 +65,7 @@ def synthesize(task_type: TaskType,
             "population": it.get("population"),
             "snippet": (it.get("snippet") or "")[:400],
             "reliability_label": it.get("reliability_label"),
+            "reliability_reasons": it.get("reliability_reasons"),
         })
 
     meta_bits = []
