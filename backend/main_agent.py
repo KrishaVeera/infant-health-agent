@@ -1,5 +1,5 @@
 # backend/main_agent.py
-import os, sys
+import os, sys, re
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from backend.router_agent import route_query
@@ -8,13 +8,16 @@ from backend.guidelines import fetch_guidelines_for_query
 from backend.blog_news_retriever import web_search_duckduckgo
 from backend.provenance_validator import assess_items
 from backend.synthesizer import synthesize
+from backend.validator import validate
+
+# ---------------- helpers ----------------
 
 def ask_for_clarification_if_needed(route, user_query: str):
     """
     If router provided clarify prompts, ask user interactively and re-route.
     Returns a potentially-updated route (or the original if no clarify needed).
     """
-    if route.clarify:
+    if getattr(route, "clarify", None):
         print("\nThe router needs clarification before continuing:")
         for c in route.clarify:
             print(" -", c)
@@ -22,10 +25,28 @@ def ask_for_clarification_if_needed(route, user_query: str):
         if not user_input:
             print("No clarification provided; continuing with best-effort search.")
             return route
-        # merge user input into original query and re-route
         combined = f"{user_query} {user_input}"
         return route_query(combined)
     return route
+
+def _strip_compare_words(q: str) -> str:
+    # remove leading “compare/versus/compare … between … and …” to broaden web search
+    q = re.sub(r"\b(compare|versus|vs\.?)\b", "", q, flags=re.I).strip()
+    q = re.sub(r"\bbetween\b", "", q, flags=re.I).strip()
+    q = re.sub(r"\s{2,}", " ", q)
+    return q
+
+def _broaden_query(base: str, route) -> list[str]:
+    """
+    Produce a few progressively-broader queries for a 2nd-chance web search.
+    Ordered from most-specific to broadest.
+    """
+    stripped = _strip_compare_words(base)
+    terms = ["infant", "vaccination", "schedule"]
+    alt1 = f"{stripped} " + " ".join(terms)
+    alt2 = " ".join(terms + ["WHO", "CDC"])
+    alt3 = "infant immunization schedule WHO CDC"
+    return [alt1, alt2, alt3]
 
 def _enrich_and_summarize(route, items):
     # Reliability assessment (adds reliability_score/label/reasons)
@@ -39,6 +60,7 @@ def _enrich_and_summarize(route, items):
         if reasons:
             for r in reasons:
                 print("   -", r)
+
     # Synthesize
     result = synthesize(
         task_type=route.task_type,
@@ -50,9 +72,19 @@ def _enrich_and_summarize(route, items):
         },
         items=items_scored,
     )
-    print("\n--- SYNTHESIZER OUTPUT ---\n")
-    print(result["summary_block"])
-    return result
+
+    # Validate synthesized text
+    val = validate(result["summary_block"], items_scored, time_horizon_years=route.time_horizon_years)
+
+    print("\n--- VALIDATED OUTPUT ---\n")
+    print(val["validated_text"])
+    if val["issues"]:
+        print("\n(validator notes)")
+        for i in val["issues"]:
+            print("-", i)
+    return val
+
+# ---------------- main pipeline ----------------
 
 def run_pipeline(user_query: str):
     # initial route
@@ -85,7 +117,7 @@ def run_pipeline(user_query: str):
         return _enrich_and_summarize(route, items)
 
     elif route.task_type == "GUIDELINE_COMPARE":
-        # first try with provided geography (if any)
+        # 1) Guidelines (never empty)
         guides = fetch_guidelines_for_query(
             clean_query=route.clean_query,
             geography=route.geography,
@@ -95,7 +127,6 @@ def run_pipeline(user_query: str):
         for g in guides:
             print(f"- {g.org} {g.year or ''} | {g.title} -> {g.url}")
 
-        # If empty, broaden the search (fallback) and increase k
         fallback_note = None
         if not guides:
             print("\nNo WHO/CDC guidelines found for the exact query. Performing a broader guideline search...")
@@ -105,15 +136,15 @@ def run_pipeline(user_query: str):
                 k_per_site=6,
             )
             fallback_note = (
-                "NOTE: No direct WHO/CDC match found for the exact query — "
-                "results below come from a broader search and may be less specific. "
-                "Try adding age/region (e.g., '0-6 months' or 'Canada') to improve precision."
+                "No direct WHO/CDC guideline matched the exact query — "
+                "broader search used; add age/region keywords to improve precision."
             )
 
         print("\n--- GUIDELINES (final) ---")
         for g in guides:
             print(f"- {g.org} {g.year or ''} | {g.title} -> {g.url}")
 
+        # 2) Support papers
         support_papers = []
         if route.need_supporting_evidence:
             support_papers = retrieve_pico_papers(
@@ -127,13 +158,25 @@ def run_pipeline(user_query: str):
             for s in support_papers:
                 print(f"- {s.year} | {s.study_type or 'Study'} | {s.title} -> {s.url}")
 
-        # Blogs/news (context + corroboration)
+        # 3) Web (blogs/news) with retry + note (never empty)
         web_hits = web_search_duckduckgo(route.clean_query, k=3)
-        print("\n--- WEB (blogs/news) ---")
-        for w in web_hits:
-            print(f"- {w.year or ''} | {w.org} | {w.title} -> {w.url}")
+        web_note = None
+        if not web_hits:
+            print("\nNo relevant blogs/news for the exact query. Trying broader web queries...")
+            for alt in _broaden_query(route.clean_query, route):
+                web_hits = web_search_duckduckgo(alt, k=5)
+                if web_hits:
+                    web_note = f"Broadened web query used: “{alt}”."
+                    break
 
-        # Build items list; if guides empty, add explanatory guideline note item
+        print("\n--- WEB (blogs/news) ---")
+        if web_hits:
+            for w in web_hits:
+                print(f"- {w.year or ''} | {w.org} | {w.title} -> {w.url}")
+        else:
+            print("- (no hits after broadening)")
+
+        # 4) Build items (insert NOTE rows if needed so synthesizer always has context)
         items = []
         if guides:
             items.extend([{
@@ -142,18 +185,11 @@ def run_pipeline(user_query: str):
                 "url": g.url, "org": g.org
             } for g in guides])
         else:
-            # explanatory placeholder so synthesizer always has at least one guideline-like item
-            note = fallback_note or (
-                "No WHO/CDC guideline matched the exact query. "
-                "A broader search was performed; results may be less specific."
-            )
             items.append({
                 "source_type": "guideline",
                 "title": "No direct guideline found for exact query",
-                "snippet": note,
-                "year": None,
-                "url": "",
-                "org": "NOTE"
+                "snippet": fallback_note or "Broader search used.",
+                "year": None, "url": "", "org": "NOTE"
             })
 
         items.extend([{
@@ -163,11 +199,19 @@ def run_pipeline(user_query: str):
             "population": s.population
         } for s in support_papers])
 
-        items.extend([{
-            "source_type": "web",
-            "title": w.title, "snippet": w.snippet, "year": w.year,
-            "url": w.url, "org": w.org
-        } for w in web_hits])
+        if web_hits:
+            items.extend([{
+                "source_type": "web",
+                "title": w.title, "snippet": w.snippet, "year": w.year,
+                "url": w.url, "org": w.org
+            } for w in web_hits])
+        else:
+            items.append({
+                "source_type": "web",
+                "title": "No blogs/news matched the exact query",
+                "snippet": web_note or "Tried broader queries; consider rephrasing.",
+                "year": None, "url": "", "org": "NOTE"
+            })
 
         return _enrich_and_summarize(route, items)
 
@@ -176,7 +220,6 @@ def run_pipeline(user_query: str):
         return {"summary_block": "Please clarify your question (age range, region/org, or outcome)."}
 
 if __name__ == "__main__":
-    # Try guideline compare (interactive if router asks)
     import sys
     q = " ".join(sys.argv[1:]) or "Compare infant vaccination schedules between WHO and CDC"
     run_pipeline(q)
